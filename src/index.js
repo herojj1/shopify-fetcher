@@ -7,13 +7,16 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const app  = express();
 const PORT = process.env.PORT || 8000;
 
+// ── LOCKED PRICE BAND: $0.10 – $5.00 ────────────────────────────────
+const PRICE_FLOOR = 0.10;
+const PRICE_CEIL  = 5.00;
+
 const SEARCH_ENDPOINTS = [
   "https://shop.app/agents/search",
   "https://shop.app/web/api/catalog/search",
 ];
-const PRICE_FLOOR = 0.10;
-const PRICE_CEIL  = 5.00;
-const DEV_TAG     = "@Mod_By_Kamal";
+
+const DEV_TAG       = "@SUPERGREMLIN01";
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT     = 1000;
 const CONCURRENCY   = 4;
@@ -40,7 +43,14 @@ function siteFromUrl(url) {
   } catch { return null; }
 }
 
-// ── MARKDOWN PARSER ────────────────────────────────────────────────────
+function fillTemplate(tpl, id) {
+  if (!tpl) return "";
+  return tpl
+    .replace(/\{id\}/gi, id)
+    .replace(/%7Bid%7D/gi, id)
+    .replace(/%7bid%7d/gi, id);
+}
+
 function parseMarkdown(text) {
   if (!text || typeof text !== "string") return [];
   if (text.trim().startsWith("# Error")) return [];
@@ -49,8 +59,7 @@ function parseMarkdown(text) {
   const out = [];
 
   for (const block of blocks) {
-    const rawLines = block.split("\n").map(l => l.trim());
-    const lines = rawLines.filter(Boolean);
+    const lines = block.split("\n").map(l => l.trim()).filter(Boolean);
     if (lines.length < 2) continue;
 
     const title = lines[0];
@@ -71,7 +80,7 @@ function parseMarkdown(text) {
       if (!productUrl && /^https?:\/\//i.test(l)
           && !/^img:/i.test(l)
           && !/^checkout:/i.test(l)
-          && !/\/cart\/\d/.test(l)) {
+          && !/\/cart\//.test(l)) {
         productUrl = l;
       }
       if (!checkoutTpl && /^checkout:\s*/i.test(l)) {
@@ -88,18 +97,15 @@ function parseMarkdown(text) {
       if (m) variantId = m[1];
     }
     if (!variantId) {
-      const m = block.match(/\(id:\s*(\d+)\)/);
+      const m = block.match(/\((\d{6,})\)/);
       if (m) variantId = m[1];
     }
     if (!variantId) {
-      const m = block.match(/(?:^|\n)\s*-\s*(?:[^()\n]*?)\bid:\s*(\d{6,})/);
+      const m = block.match(/\/cart\/(\d+)/);
       if (m) variantId = m[1];
     }
 
-    let checkout = "";
-    if (checkoutTpl) {
-      checkout = variantId ? checkoutTpl.replace(/\{id\}/g, variantId) : checkoutTpl;
-    }
+    let checkout = fillTemplate(checkoutTpl, variantId);
     if (!checkout && productUrl && variantId) {
       const site = siteFromUrl(productUrl);
       if (site) checkout = `${site}/cart/${variantId}:1`;
@@ -122,7 +128,6 @@ function parseMarkdown(text) {
   return out;
 }
 
-// ── FETCH ──────────────────────────────────────────────────────────────
 async function searchOnce(keyword) {
   for (const base of SEARCH_ENDPOINTS) {
     const url = new URL(base);
@@ -130,6 +135,8 @@ async function searchOnce(keyword) {
     url.searchParams.set("limit", "10");
     url.searchParams.set("ships_to", "US");
     url.searchParams.set("available_for_sale", "1");
+    url.searchParams.set("min_price", PRICE_FLOOR.toFixed(2));
+    url.searchParams.set("max_price", PRICE_CEIL.toFixed(2));
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
@@ -145,7 +152,6 @@ async function searchOnce(keyword) {
           const text = await r.text();
           const items = parseMarkdown(text);
           if (items.length) return items;
-          // no items parsed → try next endpoint
           break;
         }
         if (r.status === 429 || r.status >= 500) {
@@ -166,7 +172,7 @@ async function searchOnce(keyword) {
 }
 
 async function fetchAllVariants(keyword, wantResult) {
-  const suffixes = ["", " cheap", " sale", " deal", " new", " mini", " under 5"];
+  const suffixes = ["", " cheap", " sale", " deal", " new", " mini"];
   const passes = Math.min(suffixes.length, Math.max(3, Math.ceil(wantResult / 10) + 1));
   const queries = suffixes.slice(0, passes).map(s => keyword + s);
 
@@ -207,7 +213,6 @@ function shape(v) {
   };
 }
 
-// ── ROUTES ─────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
@@ -261,5 +266,5 @@ app.get("/", async (req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`shopify-fetcher running on port ${PORT}`);
+  console.log(`shopify-fetcher running on port ${PORT} | band $${PRICE_FLOOR}–$${PRICE_CEIL}`);
 });
