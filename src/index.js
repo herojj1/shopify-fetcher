@@ -7,14 +7,16 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const app  = express();
 const PORT = process.env.PORT || 8000;
 
-const SHOP_API_BASE = process.env.SHOP_API_BASE
-  || "https://shop.app/web/api/catalog/search";
+const SEARCH_ENDPOINTS = [
+  "https://shop.app/agents/search",
+  "https://shop.app/web/api/catalog/search",
+];
 const PRICE_FLOOR = 0.10;
 const PRICE_CEIL  = 5.00;
 const DEV_TAG     = "@Mod_By_Kamal";
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT     = 1000;
-const CONCURRENCY   = 6;
+const CONCURRENCY   = 4;
 const MAX_RETRIES   = 2;
 
 const CORS = {
@@ -30,14 +32,7 @@ app.use((req, res, next) => {
   next();
 });
 
-function parsePrice(raw) {
-  if (raw === null || raw === undefined) return null;
-  const cleaned = String(raw).replace(/[^\d.,]/g, "").replace(",", ".");
-  const n = parseFloat(cleaned);
-  return Number.isFinite(n) ? n : null;
-}
-
-function siteFromCheckout(url) {
+function siteFromUrl(url) {
   if (!url) return null;
   try {
     const u = new URL(url);
@@ -45,108 +40,129 @@ function siteFromCheckout(url) {
   } catch { return null; }
 }
 
-function harvestVariants(node, out) {
-  if (!node || typeof node !== "object") return;
+// ── MARKDOWN PARSER ────────────────────────────────────────────────────
+function parseMarkdown(text) {
+  if (!text || typeof text !== "string") return [];
+  if (text.trim().startsWith("# Error")) return [];
 
-  if (
-    node.id !== undefined &&
-    (node.checkoutUrl || node.checkout_url) &&
-    (node.price || node.priceRange)
-  ) {
-    const checkout = node.checkoutUrl || node.checkout_url;
-    const site = siteFromCheckout(checkout);
+  const blocks = text.split(/\n\s*---\s*\n/);
+  const out = [];
 
-    if (site) {
-      let priceVal = null;
-      let currency = "USD";
+  for (const block of blocks) {
+    const rawLines = block.split("\n").map(l => l.trim());
+    const lines = rawLines.filter(Boolean);
+    if (lines.length < 2) continue;
 
-      if (typeof node.price === "object" && node.price !== null) {
-        priceVal = parsePrice(node.price.amount ?? node.price.value);
-        currency = node.price.currencyCode || node.price.currency || "USD";
-      } else {
-        priceVal = parsePrice(node.price);
+    const title = lines[0];
+    if (title.startsWith("#")) continue;
+
+    const priceLine = lines[1] || "";
+    const priceMatch = priceLine.match(/\$\s*([\d.,]+)/);
+    if (!priceMatch) continue;
+    const price = parseFloat(priceMatch[1].replace(/,/g, ""));
+    if (!Number.isFinite(price)) continue;
+    if (price < PRICE_FLOOR || price > PRICE_CEIL) continue;
+
+    let productUrl = "";
+    let checkoutTpl = "";
+    let productId = "";
+
+    for (const l of lines) {
+      if (!productUrl && /^https?:\/\//i.test(l)
+          && !/^img:/i.test(l)
+          && !/^checkout:/i.test(l)
+          && !/\/cart\/\d/.test(l)) {
+        productUrl = l;
       }
-
-      if (priceVal !== null && priceVal >= PRICE_FLOOR && priceVal <= PRICE_CEIL) {
-        let vid = String(node.id);
-        if (vid.startsWith("gid://shopify/ProductVariant/")) {
-          vid = vid.split("/").pop();
-        }
-        out.push({
-          site, variant_id: vid, price_num: priceVal, currency,
-          checkout,
-          title: node.displayName || node.title || "",
-          available: node.availableForSale !== false,
-        });
+      if (!checkoutTpl && /^checkout:\s*/i.test(l)) {
+        checkoutTpl = l.replace(/^checkout:\s*/i, "").trim();
+      }
+      if (!productId && /^id:\s*/i.test(l)) {
+        productId = l.replace(/^id:\s*/i, "").trim();
       }
     }
+
+    let variantId = "";
+    if (productUrl) {
+      const m = productUrl.match(/[?&]variant=(\d+)/);
+      if (m) variantId = m[1];
+    }
+    if (!variantId) {
+      const m = block.match(/\(id:\s*(\d+)\)/);
+      if (m) variantId = m[1];
+    }
+    if (!variantId) {
+      const m = block.match(/(?:^|\n)\s*-\s*(?:[^()\n]*?)\bid:\s*(\d{6,})/);
+      if (m) variantId = m[1];
+    }
+
+    let checkout = "";
+    if (checkoutTpl) {
+      checkout = variantId ? checkoutTpl.replace(/\{id\}/g, variantId) : checkoutTpl;
+    }
+    if (!checkout && productUrl && variantId) {
+      const site = siteFromUrl(productUrl);
+      if (site) checkout = `${site}/cart/${variantId}:1`;
+    }
+
+    const site = siteFromUrl(productUrl) || siteFromUrl(checkout);
+    if (!site) continue;
+
+    out.push({
+      site,
+      variant_id: variantId || productId || "",
+      price_num: price,
+      currency: "USD",
+      checkout,
+      title,
+      available: true,
+    });
   }
 
-  for (const key of Object.keys(node)) {
-    const child = node[key];
-    if (Array.isArray(child)) {
-      for (const item of child) harvestVariants(item, out);
-    } else if (child && typeof child === "object") {
-      harvestVariants(child, out);
-    }
-  }
+  return out;
 }
 
-function extractJson(text) {
-  if (!text) return null;
-  const t = text.trim();
-  try { return JSON.parse(t); } catch {}
-  const fenced = t.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (fenced) {
-    try { return JSON.parse(fenced[1].trim()); } catch {}
-  }
-  const brace = t.search(/[{[]/);
-  if (brace >= 0) {
-    const slice = t.slice(brace);
-    for (let end = slice.length; end > 20; end--) {
-      try { return JSON.parse(slice.slice(0, end)); } catch {}
-    }
-  }
-  return null;
-}
-
+// ── FETCH ──────────────────────────────────────────────────────────────
 async function searchOnce(keyword) {
-  const url = new URL(SHOP_API_BASE);
-  url.searchParams.set("query", keyword);
-  url.searchParams.set("limit", "10");
-  url.searchParams.set("products_limit", "10");
-  url.searchParams.set("ships_to", "US");
-  url.searchParams.set("available_for_sale", "1");
+  for (const base of SEARCH_ENDPOINTS) {
+    const url = new URL(base);
+    url.searchParams.set("query", keyword);
+    url.searchParams.set("limit", "10");
+    url.searchParams.set("ships_to", "US");
+    url.searchParams.set("available_for_sale", "1");
 
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      const r = await fetch(url.toString(), {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-          Accept: "application/json, text/markdown, */*",
-          "Accept-Language": "en-US,en;q=0.9",
-          Referer: "https://shop.app/",
-        },
-      });
-      if (r.ok) {
-        const ct = r.headers.get("content-type") || "";
-        if (ct.includes("json")) return await r.json().catch(() => null);
-        return extractJson(await r.text());
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const r = await fetch(url.toString(), {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            Accept: "text/markdown, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            Referer: "https://shop.app/",
+          },
+        });
+        if (r.ok) {
+          const text = await r.text();
+          const items = parseMarkdown(text);
+          if (items.length) return items;
+          // no items parsed → try next endpoint
+          break;
+        }
+        if (r.status === 429 || r.status >= 500) {
+          await new Promise(res => setTimeout(res, 300 * (attempt + 1)));
+          continue;
+        }
+        break;
+      } catch {
+        if (attempt < MAX_RETRIES) {
+          await new Promise(res => setTimeout(res, 300 * (attempt + 1)));
+          continue;
+        }
+        break;
       }
-      if (r.status === 429 || r.status >= 500) {
-        await new Promise(r => setTimeout(r, 200 * (attempt + 1)));
-        continue;
-      }
-      return null;
-    } catch {
-      if (attempt < MAX_RETRIES) {
-        await new Promise(r => setTimeout(r, 200 * (attempt + 1)));
-        continue;
-      }
-      return null;
     }
   }
-  return null;
+  return [];
 }
 
 async function fetchAllVariants(keyword, wantResult) {
@@ -157,20 +173,13 @@ async function fetchAllVariants(keyword, wantResult) {
   const all = [];
   for (let i = 0; i < queries.length; i += CONCURRENCY) {
     const batch = queries.slice(i, i + CONCURRENCY);
-    const results = await Promise.allSettled(
-      batch.map(q => searchOnce(q).then(d => {
-        if (!d) return [];
-        const bucket = [];
-        harvestVariants(d, bucket);
-        return bucket;
-      }))
-    );
+    const results = await Promise.allSettled(batch.map(q => searchOnce(q)));
     for (const r of results) {
       if (r.status === "fulfilled" && Array.isArray(r.value)) {
         all.push(...r.value);
       }
     }
-    if (all.length >= wantResult * 3) break;
+    if (all.length >= wantResult * 2) break;
   }
   return all;
 }
@@ -179,8 +188,9 @@ function dedupe(list) {
   const seen = new Set();
   const out  = [];
   for (const v of list) {
-    if (!v.variant_id || seen.has(v.variant_id)) continue;
-    seen.add(v.variant_id);
+    const key = v.variant_id || v.checkout;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
     out.push(v);
   }
   return out;
@@ -197,6 +207,7 @@ function shape(v) {
   };
 }
 
+// ── ROUTES ─────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
@@ -228,9 +239,7 @@ app.get("/", async (req, res) => {
 
       const raw   = await fetchAllVariants(keyword, wantResult);
       const clean = dedupe(raw).slice(0, wantResult);
-      for (const v of clean) {
-        res.write(JSON.stringify(shape(v)) + "\n");
-      }
+      for (const v of clean) res.write(JSON.stringify(shape(v)) + "\n");
       return res.end();
     }
 
